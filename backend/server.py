@@ -1,52 +1,62 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from dotenv import load_dotenv
-from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-import os
-import logging
 import asyncio
-import uuid
 import base64
-import jwt
-import bcrypt
+import logging
+import os
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional, Literal
-from datetime import datetime, timezone, timedelta
+from typing import List, Literal, Optional
 
+import bcrypt
+import certifi
+import jwt
+import requests as http_requests
 import resend
-from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
+from dotenv import load_dotenv
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.responses import JSONResponse
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, ConfigDict, Field
+from starlette.middleware.cors import CORSMiddleware
 
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+load_dotenv(ROOT_DIR / ".env")
 
 # ---- Config ----
-MONGO_URL = os.environ['MONGO_URL']
-DB_NAME = os.environ['DB_NAME']
-JWT_SECRET = os.environ['JWT_SECRET']
-JWT_ALG = os.environ.get('JWT_ALGORITHM', 'HS256')
-EMERGENT_LLM_KEY = os.environ['EMERGENT_LLM_KEY']
-RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
-SENDER_EMAIL = os.environ.get('SENDER_EMAIL', 'onboarding@resend.dev')
-ADMIN_NOTIFY_EMAIL = os.environ.get('ADMIN_NOTIFY_EMAIL', '')
+MONGO_URL = os.environ["MONGO_URL"]
+DB_NAME = os.environ["DB_NAME"]
+JWT_SECRET = os.environ["JWT_SECRET"]
+JWT_ALG = os.environ.get("JWT_ALGORITHM", "HS256")
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "onboarding@resend.dev")
+ADMIN_NOTIFY_EMAIL = os.environ.get("ADMIN_NOTIFY_EMAIL", "")
 
-ADMIN_EMAIL = os.environ['ADMIN_EMAIL']
-ADMIN_PASSWORD = os.environ['ADMIN_PASSWORD']
-PARTNER_EMAIL = os.environ['PARTNER_EMAIL']
-PARTNER_PASSWORD = os.environ['PARTNER_PASSWORD']
+ADMIN_EMAIL = os.environ["ADMIN_EMAIL"]
+ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
+PARTNER_EMAIL = os.environ["PARTNER_EMAIL"]
+PARTNER_PASSWORD = os.environ["PARTNER_PASSWORD"]
 
 if RESEND_API_KEY:
     resend.api_key = RESEND_API_KEY
 
-client = AsyncIOMotorClient(MONGO_URL)
+_is_atlas = "mongodb+srv://" in MONGO_URL or "mongodb.net" in MONGO_URL
+_mongo_kwargs = {"serverSelectionTimeoutMS": 20000}
+if _is_atlas:
+    _mongo_kwargs["tls"] = True
+    _mongo_kwargs["tlsCAFile"] = certifi.where()
+
+client = AsyncIOMotorClient(MONGO_URL, **_mongo_kwargs)
 db = client[DB_NAME]
 
 app = FastAPI(title="Her Closet API")
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 
@@ -56,12 +66,12 @@ def now_iso():
 
 
 def hash_password(pw: str) -> str:
-    return bcrypt.hashpw(pw.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(pw: str, hashed: str) -> bool:
     try:
-        return bcrypt.checkpw(pw.encode('utf-8'), hashed.encode('utf-8'))
+        return bcrypt.checkpw(pw.encode("utf-8"), hashed.encode("utf-8"))
     except Exception:
         return False
 
@@ -76,12 +86,41 @@ def create_token(user_id: str, role: str, email: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
 
-async def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+def send_activity_email(to_email: str, item_name: str, hairstyle: str, ts: str) -> None:
+    """Best-effort email notification. Never raises - failures are logged only."""
+    if not RESEND_API_KEY:
+        return
+    try:
+        recipients = [e for e in [ADMIN_NOTIFY_EMAIL] if e]
+        if not recipients:
+            return
+        resend.Emails.send(
+            {
+                "from": SENDER_EMAIL,
+                "to": recipients,
+                "subject": "New try-on generated on Her Closet",
+                "html": (
+                    f"<p>{to_email} generated a try-on.</p>"
+                    f"<p>Item: {item_name}</p>"
+                    f"<p>Hairstyle: {hairstyle}</p>"
+                    f"<p>Time: {ts}</p>"
+                ),
+            }
+        )
+    except Exception:
+        logger.exception("Failed to send activity email (non-fatal)")
+
+
+async def get_current_user(
+    creds: HTTPAuthorizationCredentials = Depends(security),
+) -> dict:
     try:
         payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=[JWT_ALG])
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
-    user = await db.users.find_one({"id": payload.get("user_id")}, {"_id": 0, "password_hash": 0})
+    user = await db.users.find_one(
+        {"id": payload.get("user_id")}, {"_id": 0, "password_hash": 0}
+    )
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
     return user
@@ -128,37 +167,45 @@ async def seed_users():
 
     existing_admin = await db.users.find_one({"email": ADMIN_EMAIL})
     if not existing_admin:
-        await db.users.insert_one({
-            "id": str(uuid.uuid4()),
-            "email": ADMIN_EMAIL,
-            "password_hash": hash_password(ADMIN_PASSWORD),
-            "role": "admin",
-            "display_name": "Admin",
-            "created_at": now_iso(),
-        })
+        await db.users.insert_one(
+            {
+                "id": str(uuid.uuid4()),
+                "email": ADMIN_EMAIL,
+                "password_hash": hash_password(ADMIN_PASSWORD),
+                "role": "admin",
+                "display_name": "Admin",
+                "created_at": now_iso(),
+            }
+        )
         logger.info(f"Seeded admin user: {ADMIN_EMAIL}")
     else:
-        # Keep password in sync with env (idempotent reseed)
         await db.users.update_one(
             {"email": ADMIN_EMAIL},
-            {"$set": {"password_hash": hash_password(ADMIN_PASSWORD), "role": "admin"}}
+            {"$set": {"password_hash": hash_password(ADMIN_PASSWORD), "role": "admin"}},
         )
 
     existing_partner = await db.users.find_one({"email": PARTNER_EMAIL})
     if not existing_partner:
-        await db.users.insert_one({
-            "id": str(uuid.uuid4()),
-            "email": PARTNER_EMAIL,
-            "password_hash": hash_password(PARTNER_PASSWORD),
-            "role": "partner",
-            "display_name": "Her",
-            "created_at": now_iso(),
-        })
+        await db.users.insert_one(
+            {
+                "id": str(uuid.uuid4()),
+                "email": PARTNER_EMAIL,
+                "password_hash": hash_password(PARTNER_PASSWORD),
+                "role": "partner",
+                "display_name": "Her",
+                "created_at": now_iso(),
+            }
+        )
         logger.info(f"Seeded partner user: {PARTNER_EMAIL}")
     else:
         await db.users.update_one(
             {"email": PARTNER_EMAIL},
-            {"$set": {"password_hash": hash_password(PARTNER_PASSWORD), "role": "partner"}}
+            {
+                "$set": {
+                    "password_hash": hash_password(PARTNER_PASSWORD),
+                    "role": "partner",
+                }
+            },
         )
 
 
@@ -186,7 +233,7 @@ async def login(req: LoginRequest):
             "email": user["email"],
             "role": user["role"],
             "display_name": user.get("display_name", ""),
-        }
+        },
     }
 
 
@@ -197,7 +244,9 @@ async def me(user: dict = Depends(get_current_user)):
 
 # Wardrobe
 @api_router.post("/wardrobe")
-async def create_wardrobe_item(item: WardrobeItemCreate, user: dict = Depends(get_current_user)):
+async def create_wardrobe_item(
+    item: WardrobeItemCreate, user: dict = Depends(get_current_user)
+):
     doc = {
         "id": str(uuid.uuid4()),
         "name": item.name,
@@ -227,7 +276,9 @@ async def delete_wardrobe(item_id: str, user: dict = Depends(get_current_user)):
 
 # Reference photos
 @api_router.post("/references")
-async def create_reference(ref: ReferencePhotoCreate, user: dict = Depends(get_current_user)):
+async def create_reference(
+    ref: ReferencePhotoCreate, user: dict = Depends(get_current_user)
+):
     doc = {
         "id": str(uuid.uuid4()),
         "name": ref.name or "Reference",
@@ -242,7 +293,9 @@ async def create_reference(ref: ReferencePhotoCreate, user: dict = Depends(get_c
 
 @api_router.get("/references")
 async def list_references(user: dict = Depends(get_current_user)):
-    items = await db.references.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    items = (
+        await db.references.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    )
     return items
 
 
@@ -261,16 +314,16 @@ def _strip_data_url(b64: str) -> str:
     return b64
 
 
-async def generate_tryon_image(reference_b64: str, clothing_b64: str, clothing_name: str, category: str, hairstyle: str) -> str:
+async def generate_tryon_image(
+    reference_b64: str,
+    clothing_b64: str,
+    clothing_name: str,
+    category: str,
+    hairstyle: str,
+) -> str:
     """Returns base64 PNG of generated try-on image."""
     ref_clean = _strip_data_url(reference_b64)
     cloth_clean = _strip_data_url(clothing_b64)
-
-    chat = LlmChat(
-        api_key=EMERGENT_LLM_KEY,
-        session_id=f"tryon-{uuid.uuid4()}",
-        system_message="You are an expert fashion virtual try-on artist. Generate photorealistic images."
-    ).with_model("gemini", "gemini-3.1-flash-image-preview").with_params(modalities=["image", "text"])
 
     prompt = (
         "TASK: Virtual try-on. You are given TWO input images.\n"
@@ -286,51 +339,46 @@ async def generate_tryon_image(reference_b64: str, clothing_b64: str, clothing_n
         f"Preserve the garment's color, pattern, fabric, cut, length, and details faithfully.\n"
         f"- Style her hair as: {hairstyle}.\n\n"
         "OUTPUT REQUIREMENTS:\n"
-        "- Photorealistic, full-body portrait, head-to-toe visible.\n"
-        "- Soft natural studio lighting, clean neutral background.\n"
-        "- Realistic fit and draping of the garment on her body.\n"
-        "- No text, no watermarks, no logos, no extra people, no accessories not present in either input."
+        "Return a single photorealistic image only."
     )
 
-    msg = UserMessage(
-        text=prompt,
-        file_contents=[ImageContent(ref_clean), ImageContent(cloth_clean)]
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-2.5-flash-image:generateContent"
     )
-    text, images = await chat.send_message_multimodal_response(msg)
-    if not images:
-        raise HTTPException(status_code=502, detail="Image generation failed (no image returned)")
-    return images[0]["data"]  # base64 string
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": ref_clean}},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": cloth_clean}},
+                ]
+            }
+        ],
+        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
+    }
 
+    resp = await asyncio.to_thread(
+        http_requests.post, url, headers=headers, json=payload, timeout=60
+    )
+    if resp.status_code != 200:
+        logger.error(f"Gemini API error {resp.status_code}: {resp.text}")
+        raise HTTPException(
+            status_code=502, detail=f"Gemini API error: {resp.text[:300]}"
+        )
+    data = resp.json()
 
-def send_activity_email(actor_email: str, clothing_name: str, hairstyle: str, ts_iso: str):
-    if not RESEND_API_KEY or not ADMIN_NOTIFY_EMAIL:
-        logger.warning("Resend not configured or no admin notify email — skipping email")
-        return None
-    html = f"""
-    <div style="font-family:Manrope,Helvetica,Arial,sans-serif;background:#FAF9F6;padding:32px;color:#3E2723;">
-      <div style="max-width:520px;margin:0 auto;background:#fff;border-radius:24px;padding:32px;box-shadow:0 8px 30px rgba(203,153,126,0.08);">
-        <h1 style="font-family:Georgia,serif;font-weight:300;font-size:28px;margin:0 0 12px 0;">A new try-on in Her Closet</h1>
-        <p style="margin:0 0 16px 0;line-height:1.6;">She just tried something on.</p>
-        <table style="width:100%;border-collapse:collapse;margin-top:16px;">
-          <tr><td style="padding:8px 0;color:#8D6E63;">Item</td><td style="padding:8px 0;">{clothing_name}</td></tr>
-          <tr><td style="padding:8px 0;color:#8D6E63;">Hairstyle</td><td style="padding:8px 0;">{hairstyle}</td></tr>
-          <tr><td style="padding:8px 0;color:#8D6E63;">When</td><td style="padding:8px 0;">{ts_iso}</td></tr>
-          <tr><td style="padding:8px 0;color:#8D6E63;">By</td><td style="padding:8px 0;">{actor_email}</td></tr>
-        </table>
-      </div>
-    </div>
-    """
-    try:
-        params = {
-            "from": SENDER_EMAIL,
-            "to": [ADMIN_NOTIFY_EMAIL],
-            "subject": "Her Closet — a new try-on",
-            "html": html,
-        }
-        return resend.Emails.send(params)
-    except Exception as e:
-        logger.error(f"Failed to send email: {e}")
-        return None
+    parts = data["candidates"][0]["content"]["parts"]
+    for part in parts:
+        inline = part.get("inlineData") or part.get("inline_data")
+        if inline and inline.get("data"):
+            return inline["data"]
+
+    raise HTTPException(
+        status_code=502, detail="Image generation returned no image data"
+    )
 
 
 # Try-on
@@ -366,10 +414,12 @@ async def create_tryon(req: TryOnRequest, user: dict = Depends(get_current_user)
     }
     await db.tryons.insert_one(doc)
 
-    # Send email notification (non-blocking)
-    asyncio.create_task(asyncio.to_thread(
-        send_activity_email, user["email"], item["name"], req.hairstyle, ts
-    ))
+    # Send email notification (non-blocking, never raises)
+    asyncio.create_task(
+        asyncio.to_thread(
+            send_activity_email, user["email"], item["name"], req.hairstyle, ts
+        )
+    )
 
     doc.pop("_id", None)
     return doc
@@ -396,7 +446,7 @@ async def create_note(note: LoveNoteCreate, user: dict = Depends(require_admin))
         "id": str(uuid.uuid4()),
         "text": note.text,
         "created_at": now_iso(),
-        "read_by": [],  # list of user_ids who've seen it
+        "read_by": [],
     }
     await db.notes.insert_one(doc)
     doc.pop("_id", None)
@@ -411,23 +461,17 @@ async def list_notes(user: dict = Depends(get_current_user)):
 
 @api_router.get("/notes/latest-unread")
 async def latest_unread_note(user: dict = Depends(get_current_user)):
-    # Only the partner sees popups; admin doesn't get their own popups
     if user.get("role") == "admin":
         return {"note": None}
     note = await db.notes.find_one(
-        {"read_by": {"$nin": [user["id"]]}},
-        {"_id": 0},
-        sort=[("created_at", -1)]
+        {"read_by": {"$nin": [user["id"]]}}, {"_id": 0}, sort=[("created_at", -1)]
     )
     return {"note": note}
 
 
 @api_router.post("/notes/{note_id}/read")
 async def mark_note_read(note_id: str, user: dict = Depends(get_current_user)):
-    await db.notes.update_one(
-        {"id": note_id},
-        {"$addToSet": {"read_by": user["id"]}}
-    )
+    await db.notes.update_one({"id": note_id}, {"$addToSet": {"read_by": user["id"]}})
     return {"ok": True}
 
 
@@ -444,7 +488,16 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception(f"Unhandled error on {request.method} {request.url.path}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error: {str(exc)}"},
+    )
