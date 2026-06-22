@@ -344,7 +344,7 @@ async def generate_tryon_image(
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-2.5-flash-image:generateContent"
+        "gemini-3-pro-image:generateContent"
     )
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
     payload = {
